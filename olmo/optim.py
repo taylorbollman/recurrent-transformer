@@ -1296,6 +1296,10 @@ def get_param_groups(cfg: TrainConfig, model: nn.Module) -> List[Dict[str, Any]]
         )
 
     # Validate fields.
+    owned_ids = [id(p) for group in param_groups for p in group["params"]]
+    expected_ids = {id(p) for p in model.parameters() if p.requires_grad}
+    if len(owned_ids) != len(set(owned_ids)) or set(owned_ids) != expected_ids:
+        raise ValueError("optimizer groups must own each trainable Parameter exactly once")
     for group in param_groups:
         for key in PARAM_GROUP_FIELDS:
             assert key in group

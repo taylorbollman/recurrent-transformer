@@ -18,6 +18,7 @@ from torch.distributed.fsdp import ShardingStrategy
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from olmo.config import (
+    BlockType,
     CheckpointType,
     DDPGradSyncMode,
     DistributedStrategy,
@@ -52,6 +53,17 @@ log = logging.getLogger("train")
 
 
 def main(cfg: TrainConfig) -> None:
+    cfg.model.validate_recurrence()
+    block_kinds = [cfg.model.block_type_for_layer(i) for i in range(cfg.model.n_layers)]
+    if any(kind in (BlockType.recurrent, BlockType.recurrent_autograd) for kind in block_kinds):
+        if not Path("/.dockerenv").is_file() or not torch.cuda.is_available():
+            raise OLMoConfigurationError("recurrent training requires the GPU project container; no CPU fallback")
+        if cfg.cuda_graph is not None:
+            raise OLMoConfigurationError("CUDA graphs are disabled pending mask and gradient validation")
+        if cfg.distributed_strategy != DistributedStrategy.single:
+            raise OLMoConfigurationError("recurrent distributed training requires a separate validation milestone")
+        if cfg.model.reference_eager and cfg.compile is not None:
+            raise OLMoConfigurationError("reference_eager requires compile=null")
     # Ensure run name set.
     if cfg.run_name is None:
         raise OLMoConfigurationError("--run_name is required")

@@ -305,6 +305,57 @@ class ModelConfig(BaseConfig):
     The transformer block implementation.
     """
 
+    recurrent_layers: Optional[List[int]] = None
+    """Explicit recurrent replacement indices; None preserves legacy global block_type."""
+
+    recurrent_backend: str = "naive"
+    """Execution backend for explicit replacements: naive or tiled."""
+
+    recurrent_write_rho: float = 1.0
+    """Persistent-write interpolation. Fractional values require pre-norm naïve recurrence."""
+
+    reference_eager: bool = False
+    """Bypass compiled recurrence helpers and internal autocast for a numerical oracle.
+
+    An explicit outer autocast context may still be used for BF16 comparisons.
+    """
+
+    def block_type_for_layer(self, index: int) -> BlockType:
+        if self.recurrent_layers is None:
+            return self.block_type
+        if index not in self.recurrent_layers:
+            return BlockType.sequential
+        return BlockType.recurrent_autograd if self.recurrent_backend == "naive" else BlockType.recurrent
+
+    def validate_recurrence(self) -> None:
+        """Validate the bounded mixed-stack contract before constructing any weights."""
+        if self.recurrent_backend not in ("naive", "tiled"):
+            raise OLMoConfigurationError("recurrent_backend must be naive or tiled")
+        if not 0.0 <= self.recurrent_write_rho <= 1.0:
+            raise OLMoConfigurationError("recurrent_write_rho must be finite and in [0, 1]")
+        if self.recurrent_layers is not None:
+            if self.block_type != BlockType.sequential:
+                raise OLMoConfigurationError("explicit recurrent_layers requires block_type=sequential")
+            if any(type(i) is not int or not 0 <= i < self.n_layers for i in self.recurrent_layers):
+                raise OLMoConfigurationError("recurrent_layers must contain in-range integer indices")
+            if len(set(self.recurrent_layers)) != len(self.recurrent_layers):
+                raise OLMoConfigurationError("recurrent_layers must be unique")
+        kinds = [self.block_type_for_layer(i) for i in range(self.n_layers)]
+        has_recurrence = any(k in (BlockType.recurrent, BlockType.recurrent_autograd) for k in kinds)
+        if not has_recurrence:
+            if self.recurrent_write_rho != 1.0:
+                raise OLMoConfigurationError("recurrent_write_rho is unused without recurrent blocks")
+            return
+        if self.rope or self.effective_n_kv_heads != self.n_heads or self.block_group_size != 1:
+            raise OLMoConfigurationError("recurrence requires RoPE off, full MHA, and block_group_size=1")
+        if self.attention_dropout or self.residual_dropout or self.embedding_dropout:
+            raise OLMoConfigurationError("the initial recurrence contract requires all dropout=0")
+        if self.recurrent_layers is not None and (self.norm_after or not self.alibi or self.flash_attention):
+            raise OLMoConfigurationError("mixed recurrence requires pre-norm, ALiBi, and flash_attention=false")
+        if self.recurrent_write_rho != 1.0:
+            if self.norm_after or BlockType.recurrent in kinds:
+                raise OLMoConfigurationError("rho != 1 requires pre-norm naive recurrence")
+
     block_group_size: int = 1
     """
     The number of blocks to group together into a single parent block.

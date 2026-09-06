@@ -11,7 +11,8 @@ import torch
 from torch.cuda import make_graphed_callables
 
 from olmo.config import CudaGraphMode, TrainConfig
-from olmo.model import OLMo, OLMoBlock
+from olmo.exceptions import OLMoConfigurationError
+from olmo.model import OLMo, OLMoBlock, BufferCache, get_causal_attention_bias
 
 
 def create_test_config(base_cfg: TrainConfig, overrides: Dict = None) -> TrainConfig:
@@ -53,14 +54,15 @@ def get_next_block_batch(cfg: TrainConfig, device: torch.device, seed: Optional[
 def alibi_attention_bias(
     model: OLMo, cfg: TrainConfig, seq_len: int
 ) -> Optional[torch.Tensor]:
-    """ALiBi slopes for ``seq_len``, or ``None`` when ALiBi is disabled.
+    """Combined causal + ALiBi bias for direct block calls.
 
-    No causal mask: recurrent blocks enforce causality structurally, and the
-    sequential OLMo forward path adds its own causal mask internally.
+    Raw ALiBi disables ordinary SDPA's causal fallback and must never be used
+    as the only mask in benchmarks that bypass OLMo.forward.
     """
     if not cfg.model.alibi:
         return None
-    return model.get_alibi_attention_bias(seq_len, model.device)
+    alibi = model.get_alibi_attention_bias(seq_len, model.device)[:, :, :seq_len, :seq_len]
+    return get_causal_attention_bias(BufferCache(), seq_len, model.device) + alibi
 
 
 def forward_pass(model: OLMo, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -76,6 +78,7 @@ def cuda_capture_block(
     cfg: TrainConfig,
     attention_bias: Optional[torch.Tensor] = None,
 ) -> torch.nn.Module:
+    raise OLMoConfigurationError("CUDA graph capture is disabled pending causal-mask and gradient validation")
     class BlockWrapperForGraph(torch.nn.Module):
         def __init__(self, block, attention_bias=None):
             super().__init__()
@@ -110,6 +113,7 @@ class BlockWrapperForModel(OLMoBlock):
 
 
 def cuda_capture_model(model: OLMo, cfg: TrainConfig) -> None:
+    raise OLMoConfigurationError("CUDA graph capture is disabled pending causal-mask and gradient validation")
     attention_bias = alibi_attention_bias(model, cfg, cfg.model.max_sequence_length)
 
     if cfg.cuda_graph == CudaGraphMode.per_layer:

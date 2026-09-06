@@ -11,6 +11,7 @@ import math
 import sys
 from abc import abstractmethod
 from collections import defaultdict
+from contextlib import nullcontext
 from functools import partial
 from typing import (
     Callable,
@@ -73,6 +74,21 @@ __all__ = [
 ]
 
 log = logging.getLogger(__name__)
+
+
+def block_autocast(config: ModelConfig, x: torch.Tensor, dtype=None):
+    """Explicit eager tests never enter CUDA autocast or silently select a device."""
+    dtype = config.precision if dtype is None else dtype
+    if config.reference_eager or x.device.type != "cuda" or dtype not in (torch.float16, torch.bfloat16):
+        return nullcontext()
+    return torch.autocast("cuda", dtype=dtype)
+
+
+def recurrent_helper(block, helper, *args):
+    """Bypass an upstream torch.compile wrapper when running the eager oracle."""
+    if block.config.reference_eager:
+        helper = getattr(helper, "_torchdynamo_orig_callable", helper)
+    return helper(*args)
 
 
 def activation_checkpoint_function(cfg: ModelConfig):
@@ -669,6 +685,13 @@ class OLMoBlock(nn.Module):
                 attention_bias[:, :, key_len - query_len : key_len, :key_len], dtype
             )
 
+        if attention_bias is not None:
+            # A direct block caller may supply raw ALiBi. Positional bias does not
+            # replace causality, even when SDPA's is_causal fallback is disabled.
+            causal = get_causal_attention_bias(self.__cache, key_len, q.device)
+            future = causal[:, :, key_len - query_len : key_len, :key_len] != 0
+            attention_bias = attention_bias.masked_fill(future, torch.finfo(attention_bias.dtype).min)
+
         # Get the attention scores.
         # shape: (B, nh, T, hs)
         att = self._scaled_dot_product_attention(
@@ -874,16 +897,18 @@ class OLMoSequentialBlock(OLMoBlock):
         max_doc_len: Optional[int] = None,
         cu_doc_lens: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
-        with torch.autocast('cuda', enabled=True, dtype=self.config.precision):
+        with block_autocast(self.config, x):
             out, cache = self._real_forward(x, attention_bias, layer_past, use_cache, max_doc_len, cu_doc_lens)
         return out, cache
 
 class PreAttentionBlock(nn.Module):
     def __init__(self, obj: OLMoSequentialBlock, should_do_norm_and_permute: bool = True):
         super().__init__()
-        self.attn_norm = obj.attn_norm
-        self.kv_proj = obj.kv_proj
-        self.q_proj = obj.q_proj
+        # These are views of their owning block's modules, not new registrations.
+        # Module objects remain shared across .to(), train()/eval(), and deepcopy.
+        for name in ("attn_norm", "kv_proj", "q_proj"):
+            object.__setattr__(self, name, getattr(obj, name))
+        self.reference_eager = obj.config.reference_eager
         self.clip_qkv = obj.config.clip_qkv
         self.fused_dims = obj.fused_dims
         self.norm_after = obj.config.norm_after
@@ -893,11 +918,19 @@ class PreAttentionBlock(nn.Module):
             self.head_dim = obj.config.d_model // obj.config.n_heads
             self.effective_n_kv_heads = obj.config.effective_n_kv_heads
             self.n_heads = obj.config.n_heads
-            self.q_norm = obj.q_norm
-            self.k_norm = obj.k_norm
+            object.__setattr__(self, "q_norm", obj.q_norm)
+            object.__setattr__(self, "k_norm", obj.k_norm)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.reference_eager:
+            return self._eager_forward(x)
+        return self._compiled_forward(x)
 
     @torch.compile(dynamic=False)
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _compiled_forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self._eager_forward(x)
+
+    def _eager_forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         x_normed = self.attn_norm(x) if not self.norm_after else x # (B, L, D)
         kv = self.kv_proj(x_normed)
         q = self.q_proj(x_normed)
@@ -921,12 +954,8 @@ class PreAttentionBlock(nn.Module):
 class PostAttentionBlock(nn.Module):
     def __init__(self, obj: OLMoSequentialBlock):
         super().__init__()
-        self.attn_norm = obj.attn_norm
-        self.ff_norm = obj.ff_norm
-        self.ff_proj = obj.ff_proj
-        self.act = obj.act
-        self.ff_out = obj.ff_out
-        self.dropout = obj.dropout
+        for name in ("attn_norm", "ff_norm", "ff_proj", "act", "ff_out", "dropout"):
+            object.__setattr__(self, name, getattr(obj, name))
         self.norm_after = obj.config.norm_after
 
     def forward(self, x: torch.Tensor, att: torch.Tensor) -> torch.Tensor:
@@ -948,7 +977,7 @@ class OLMoRecurrentBlockBase(OLMoSequentialBlock):
         super().__init__(layer_id, config, cache) # initializations of:
         # self.att_proj, self.ff_proj, self.attn_norm, self.ff_norm, self.final_kv_proj
         del self.att_proj
-        self.q_proj = self.kv_proj = nn.Linear(
+        self.q_proj = nn.Linear(
             config.d_model, self.fused_dims[0], bias=config.include_bias, device=config.init_device
         )
         self.kv_proj = nn.Linear(
@@ -963,6 +992,21 @@ class OLMoRecurrentBlockBase(OLMoSequentialBlock):
         init_normal(self.kv_proj, self.std, self.cutoff_factor)
     
     def init_from_sequential_block(self, sequential_block: OLMoSequentialBlock):
+        """Weights-only block warm start; functional equality also requires rho=0.
+
+        Prefer convert_model for a full coverage report. Reject semantic changes
+        here too, before mutating any destination weights.
+        """
+        semantic_fields = (
+            "d_model", "n_heads", "effective_n_kv_heads", "norm_after", "clip_qkv",
+            "layer_norm_type", "layer_norm_eps", "layer_norm_with_affine",
+            "attention_layer_norm", "attention_layer_norm_with_affine", "bias_for_layer_norm",
+            "include_bias", "activation_type", "mlp_hidden_size", "mlp_ratio", "alibi", "rope",
+            "residual_dropout", "attention_dropout", "tanh_norm_alpha", "tanh_trainable_alpha",
+        )
+        differing = [name for name in semantic_fields if getattr(self.config, name) != getattr(sequential_block.config, name)]
+        if differing:
+            raise OLMoConfigurationError("incompatible block conversion settings: " + ", ".join(differing))
         self.kv_proj.weight.data.copy_(sequential_block.att_proj.weight.data[self.fused_dims[0]:, :])
         if sequential_block.att_proj.bias is not None:
             self.kv_proj.bias.data.copy_(sequential_block.att_proj.bias.data[self.fused_dims[0]:])
@@ -983,14 +1027,30 @@ class OLMoRecurrentBlockBase(OLMoSequentialBlock):
         if sequential_block.ff_out.bias is not None:
             self.ff_out.bias.data.copy_(sequential_block.ff_out.bias.data)
         
-        # self.attn_norm = sequential_block.attn_norm
-        # self.ff_norm = sequential_block.ff_norm
-        # if hasattr(sequential_block, 'k_norm'):
-        #     assert sequential_block.k_norm is not None
-        #     self.k_norm = sequential_block.k_norm
-        # if hasattr(sequential_block, 'q_norm'):
-        #     assert sequential_block.q_norm is not None
-        #     self.q_norm = sequential_block.q_norm
+        for name in ("attn_norm", "ff_norm", "k_norm", "q_norm", "act"):
+            src, dst = getattr(sequential_block, name), getattr(self, name)
+            if (src is None) != (dst is None):
+                raise OLMoConfigurationError(f"incompatible {name} in block conversion")
+            if src is not None:
+                dst.load_state_dict(src.state_dict(), strict=True)
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        # Upstream serialized shared Pre/Post parameters under several aliases.
+        # Accept agreeing old aliases but never silently choose between conflicting values.
+        for view in ("pre_attention_block.", "post_attention_block."):
+            alias_prefix = prefix + view
+            for key in list(state_dict):
+                if key.startswith(alias_prefix):
+                    canonical = prefix + key[len(alias_prefix):]
+                    value = state_dict.pop(key)
+                    if canonical in state_dict:
+                        if not torch.equal(state_dict[canonical], value):
+                            error_msgs.append(f"conflicting legacy alias {key} for {canonical}")
+                    else:
+                        state_dict[canonical] = value
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                     missing_keys, unexpected_keys, error_msgs)
 
     def _real_forward(
         self,
@@ -1012,7 +1072,13 @@ class OLMoRecurrentBlockBase(OLMoSequentialBlock):
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         assert (layer_past is None) and (use_cache is False) and (max_doc_len is None) and (cu_doc_lens is None), \
                "Recurrent block does not support layer_past, use_cache, max_doc_len, cu_doc_lens"
-        with torch.autocast('cuda', enabled=True, dtype=self.config.precision):
+        if not 0.0 <= self.config.recurrent_write_rho <= 1.0:
+            raise OLMoConfigurationError("recurrent_write_rho must be in [0, 1]")
+        if self.config.recurrent_write_rho != 1.0 and (
+            self.config.norm_after or self.config.block_type == BlockType.recurrent
+        ):
+            raise OLMoConfigurationError("rho != 1 requires pre-norm naive recurrence")
+        with block_autocast(self.config, x):
             out = self._real_forward(x, attention_bias)
         return out, None
 
@@ -1081,7 +1147,9 @@ class OLMoRecurrentAutogradBlock(OLMoRecurrentBlockBase):
             outputs.append(out_t)
             assert att_t.shape == out_t.shape == (B, 1, D)
 
-            final_kv = self.kv_proj(self.pre_attention_block.attn_norm(out_t))
+            rho = self.config.recurrent_write_rho
+            record = out_t if rho == 1.0 else (1.0 - rho) * x_t + rho * out_t
+            final_kv = self.kv_proj(self.attn_norm(record))
             if self.config.clip_qkv is not None:
                 final_kv.clamp_(min=-self.config.clip_qkv, max=self.config.clip_qkv)
             final_k_t, final_v_t = final_kv.split(self.fused_dims[1:], dim=-1)
@@ -1142,7 +1210,9 @@ def recompute_atts(final_v, v_init, alphas):
 
 @torch.compile(fullgraph=True)
 def mlp_batched_body(all_atts, x, block, dtype):
-    with torch.autocast('cuda', enabled=True, dtype=dtype):
+    # Backward runs outside the caller's autocast context. Recreate the actual
+    # forward projection dtype even for an eager, externally-autocast oracle.
+    with torch.autocast(x.device.type, enabled=dtype in (torch.float16, torch.bfloat16), dtype=dtype):
         all_atts = all_atts.transpose(0, 1).reshape(x.shape)
         all_atts = block.attn_out(all_atts)
         mlp_outs = block.post_attention_block(x, all_atts)
@@ -1219,7 +1289,7 @@ class OLMoRecurrentBlockTiledFunction(torch.autograd.Function):
             v_slice = final_v[(t+1-T):(t+1)].permute(1, 2, 0, 3)  # (B, n_heads, T, head_dim)
             q_slice = q[t+1:(t+1+T)].permute(1, 2, 0, 3) # (B, n_heads, T, head_dim)
             curr_s = slice(t+1, t+1+T)
-            atts[curr_s], max_logit[curr_s], sum_scores[curr_s] = block_attention_add(
+            atts[curr_s], max_logit[curr_s], sum_scores[curr_s] = recurrent_helper(block, block_attention_add,
                 atts[curr_s], max_logit[curr_s], sum_scores[curr_s],
                 k_slice,
                 v_slice,
@@ -1239,7 +1309,7 @@ class OLMoRecurrentBlockTiledFunction(torch.autograd.Function):
         saved_list = ctx.saved_tensors
         x, outs = saved_list[0], saved_list[1]
         block = ctx.block
-        autocast_ctx = torch.autocast('cuda', enabled=True, dtype=ctx.dtype)
+        autocast_ctx = torch.autocast(x.device.type, enabled=ctx.dtype in (torch.float16, torch.bfloat16), dtype=ctx.dtype)
         attention_bias = getattr(ctx, "attention_bias", None)  # (B, n_heads, L, L) or None
 
         B, L, D = x.shape
@@ -1285,8 +1355,8 @@ class OLMoRecurrentBlockTiledFunction(torch.autograd.Function):
             final_v = torch.cat(list(map(lambda x: x.detach(), final_vs)), dim=0)  # (L, B, n_heads, head_dim)
 
         # because of the blocking thing in the forward pass, we need to recompute the alphas and atts here
-        alphas = recompute_alphas(final_k, k_init, q, attention_bias)
-        atts = recompute_atts(final_v, v_init, alphas)
+        alphas = recurrent_helper(block, recompute_alphas, final_k, k_init, q, attention_bias)
+        atts = recurrent_helper(block, recompute_atts, final_v, v_init, alphas)
 
         k_grads = torch.zeros(final_k.shape, dtype=x.dtype, device=final_k.device)  # (L, B, n_heads, head_dim)
         v_grads = torch.zeros(final_v.shape, dtype=x.dtype, device=final_v.device)  # (L, B, n_heads, head_dim)
@@ -1403,7 +1473,7 @@ class OLMoRecurrentBlockTiledFunction(torch.autograd.Function):
         assert all_atts.requires_grad == False
         assert x.requires_grad == True
         with torch.enable_grad():
-            mlp_outs = mlp_batched_body(all_atts, x, block, ctx.dtype)
+            mlp_outs = recurrent_helper(block, mlp_batched_body, all_atts, x, block, ctx.dtype)
         torch.autograd.backward(mlp_outs, grad_tensors=big_grads)
         
         return x.grad, None, None
@@ -1424,6 +1494,16 @@ class OLMoRecurrentBlockTiled(OLMoRecurrentBlockBase):
         x: torch.Tensor,
         attention_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if x.device.type != "cuda":
+            raise OLMoConfigurationError("tiled recurrence requires CUDA; use naive for CPU reference tests")
+        if self.config.recurrent_write_rho != 1.0:
+            raise OLMoConfigurationError("tiled recurrence only supports rho=1")
+        if self.config.bwd_mlp_chunks < 1:
+            raise OLMoConfigurationError("bwd_mlp_chunks must be positive")
+        if attention_bias is not None and attention_bias.requires_grad:
+            raise OLMoConfigurationError("tiled recurrence does not support learned attention bias")
+        if torch.is_grad_enabled() and not x.requires_grad:
+            raise OLMoConfigurationError("tiled training requires input gradients; frozen-prefix training is unsupported")
         return OLMoRecurrentBlockTiledFunction.apply(x, attention_bias, self)
 
 class OLMoLlamaBlock(OLMoBlock):
@@ -1670,6 +1750,8 @@ class OLMoBlockGroup(nn.ModuleList):
     def set_activation_checkpointing(
         self, strategy: Optional[ActivationCheckpointingStrategy], checkpoint_func: Optional[Callable] = None
     ):
+        if strategy is not None and any(isinstance(b, OLMoRecurrentBlockTiled) for b in self.modules()):
+            raise OLMoConfigurationError("activation checkpointing with tiled recurrence is not yet validated")
         self.activation_checkpointing_strategy = strategy
         for block in self:
             block.set_activation_checkpointing(strategy, checkpoint_func=checkpoint_func)
@@ -1682,6 +1764,7 @@ class OLMo(nn.Module):
         self.__cache = BufferCache()
 
         # Validate config.
+        self.config.validate_recurrence()
         if self.config.alibi and self.config.flash_attention:
             raise OLMoConfigurationError("ALiBi is currently not supported with FlashAttention")
 
@@ -1720,7 +1803,17 @@ class OLMo(nn.Module):
             )
         )
 
-        blocks = [OLMoBlock.build(i, config, self.__cache) for i in range(config.n_layers)]
+        blocks = []
+        for i in range(config.n_layers):
+            kind = config.block_type_for_layer(i)
+            block_config = config.update_with(
+                block_type=kind,
+                recurrent_layers=None,
+                recurrent_write_rho=config.recurrent_write_rho if kind in (
+                    BlockType.recurrent, BlockType.recurrent_autograd
+                ) else 1.0,
+            )
+            blocks.append(OLMoBlock.build(i, block_config, self.__cache))
         if self.config.block_group_size > 1:
             block_groups = [
                 OLMoBlockGroup(config, i, blocks[i : i + config.block_group_size])
@@ -1759,9 +1852,19 @@ class OLMo(nn.Module):
             get_causal_attention_bias(self.__cache, config.max_sequence_length, _non_meta_init_device(config))
             self.get_alibi_attention_bias(config.max_sequence_length, _non_meta_init_device(config))
 
+    def set_recurrent_write_rho(self, rho: float) -> None:
+        """Update the model and independently owned block configs together."""
+        self.config.update_with(recurrent_write_rho=rho).validate_recurrence()
+        self.config.recurrent_write_rho = rho
+        for block in self.transformer.blocks:
+            if isinstance(block, OLMoRecurrentBlockBase):
+                block.config.recurrent_write_rho = rho
+
     def set_activation_checkpointing(
         self, strategy: Optional[ActivationCheckpointingStrategy], checkpoint_func: Optional[Callable] = None
     ):
+        if strategy is not None and any(isinstance(b, OLMoRecurrentBlockTiled) for b in self.modules()):
+            raise OLMoConfigurationError("activation checkpointing with tiled recurrence is not yet validated")
         self.activation_checkpointing_strategy = strategy
         if self.config.block_group_size != 1:
             for block_group in self.transformer.block_groups:
@@ -1907,6 +2010,14 @@ class OLMo(nn.Module):
         :param max_doc_lens: Maximum document length for each instance in the batch.
         """
         output_hidden_states = output_hidden_states if output_hidden_states is not None else False
+
+        has_recurrence = any(self.config.block_type_for_layer(i) in (
+            BlockType.recurrent, BlockType.recurrent_autograd
+        ) for i in range(self.config.n_layers))
+        if has_recurrence and (
+            past_key_values is not None or use_cache or doc_lens is not None or max_doc_lens is not None
+        ):
+            raise OLMoConfigurationError("recurrence does not support cached decoding or document packing")
 
         if past_key_values:
             assert len(past_key_values) == self.config.n_layers
@@ -2422,7 +2533,9 @@ class OLMo(nn.Module):
             new_keys_to_og_keys[new_key] = key
 
         # For backwards compatibility prior to fixing https://github.com/allenai/LLM/issues/222
-        if self.config.block_type == BlockType.sequential:
+        # Sequential and recurrent blocks share this legacy norm schema. The
+        # target modules, rather than one global block_type, determine migration.
+        if any(isinstance(block, OLMoSequentialBlock) for block in self.modules()):
             for key in list(state_dict.keys()):
                 if fnmatch(key, "transformer.*.norm.weight"):
                     tensor = state_dict.pop(key)

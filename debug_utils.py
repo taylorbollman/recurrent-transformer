@@ -4,7 +4,7 @@ from typing import Any, Dict, Optional
 import torch
 
 from olmo.config import BlockType, TrainConfig
-from olmo.model import LayerNormBase, OLMo
+from olmo.model import OLMo
 
 
 def environment_setup():
@@ -49,22 +49,10 @@ def mode_to_block_type(mode: str) -> BlockType:
 
 
 def initialize_recurrent_from_sequential(model_seq: OLMo, model_rec: OLMo):
-    for block_seq, block_rec in zip(model_seq.transformer.blocks, model_rec.transformer.blocks):
-        block_rec.init_from_sequential_block(block_seq)
-    for module_type in ["wte", "emb_norm", "wpe", "ln_f", "ff_out"]:
-        if module_type in model_rec.transformer and module_type in model_seq.transformer:
-            src_module = model_seq.transformer[module_type]
-            dst_module = model_rec.transformer[module_type]
-            if isinstance(src_module, torch.nn.Linear):
-                dst_module.weight.data.copy_(src_module.weight.data)
-                if src_module.bias is not None:
-                    dst_module.bias.data.copy_(src_module.bias.data)
-            elif isinstance(src_module, torch.nn.Embedding):
-                dst_module.weight.data.copy_(src_module.weight.data)
-            else:
-                assert isinstance(src_module, LayerNormBase), (
-                    f"module type {module_type} is not a linear or embedding; not transferring"
-                )
+    """Compatibility entrypoint for exhaustive full-model weight conversion."""
+    from olmo.checkpoint_conversion import convert_model
+
+    return convert_model(model_seq, model_rec)
 
 
 def aggressive_cleanup():

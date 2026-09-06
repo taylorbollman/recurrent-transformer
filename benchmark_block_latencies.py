@@ -10,7 +10,6 @@ environment_setup()
 
 import argparse
 import traceback
-from contextlib import nullcontext
 from itertools import product
 from typing import Optional
 
@@ -19,10 +18,8 @@ import torch
 
 from debug_utils import aggressive_cleanup, create_model, get_debug_base_config, mode_to_block_type
 from olmo.efficient_utils import (
-    BlockWrapperForModel,
     alibi_attention_bias,
     create_test_config,
-    cuda_capture_block,
     profile_block,
 )
 
@@ -88,17 +85,15 @@ def run_benchmark(
         torch.cuda.synchronize()
 
         if cfg.compile is None:
-            ctx = nullcontext() if include_backwards else torch.no_grad()
-            with ctx:
-                graphed_callable = cuda_capture_block(block, cfg, attention_bias)
-            graphed_block = BlockWrapperForModel(graphed_callable, model.device)
+            # Capture is deliberately unavailable until runtime masks and
+            # backward semantics have their own validation. Preserve the valid
+            # eager measurement instead of converting it into a failed run.
+            graphed_latency = None
         else:
             block.compile(**cfg.compile.asdict())
-            graphed_block = block
-
-        graphed_latency = profile_block(
-            graphed_block, cfg, include_backwards=include_backwards, attention_bias=None,
-        )
+            graphed_latency = profile_block(
+                block, cfg, include_backwards=include_backwards, attention_bias=attention_bias,
+            )
 
         max_memory_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
         status = "success"
@@ -125,10 +120,10 @@ def run_benchmark(
         "use_alibi": use_alibi,
     }
 
-    return [
-        {**base_row, flag_name: False, "latency_ms": vanilla_latency},
-        {**base_row, flag_name: True, "latency_ms": graphed_latency},
-    ]
+    rows = [{**base_row, flag_name: False, "latency_ms": vanilla_latency}]
+    if graphed_latency is not None:
+        rows.append({**base_row, flag_name: True, "latency_ms": graphed_latency})
+    return rows
 
 
 def main():
@@ -145,7 +140,10 @@ def main():
     args = parser.parse_args()
 
     torch._dynamo.config.cache_size_limit = 13
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    from pathlib import Path
+    if not Path("/.dockerenv").is_file() or not torch.cuda.is_available():
+        parser.error("block benchmarks require the GPU project container; no CPU fallback")
+    device = torch.device("cuda")
     mlp = args.mlp_hidden_size if args.mlp_hidden_size is not None else 4 * args.d_model
 
     results = []
