@@ -6,6 +6,7 @@ No tokenizer, dataset download, training corpus, or external logging is required
 
 import copy
 import os
+from collections import defaultdict
 from pathlib import Path
 
 import pytest
@@ -80,6 +81,7 @@ def test_selection_and_independent_configs(indices, tmp_path):
 @pytest.mark.parametrize("bad", [
     {"recurrent_layers": [3, 3]}, {"recurrent_layers": [-1]}, {"recurrent_layers": [12]},
     {"recurrent_layers": [True]}, {"recurrent_layers": [3.0]}, {"recurrent_backend": "unknown"},
+    {"recurrent_precision_policy": "unknown"},
     {"norm_after": True}, {"rope": True}, {"alibi": False}, {"n_kv_heads": 2},
     {"block_group_size": 2}, {"attention_dropout": 0.1}, {"residual_dropout": 0.1},
     {"embedding_dropout": 0.1}, {"recurrent_write_rho": -0.1}, {"recurrent_write_rho": float("nan")},
@@ -355,3 +357,112 @@ def test_bf16_tiled_random_cotangent(eager, chunks):
             relative_l2 = diff.norm() / ref.double().norm().clamp_min(1e-12)
             assert relative_l2 <= 2 * eps, (label, name, "relative L2", relative_l2.item())
             assert diff.abs().max() / scale <= 8 * eps, (label, name, "max/RMS", (diff.abs().max()/scale).item())
+
+
+@pytest.mark.parametrize("backend", ["naive", "tiled"])
+def test_fp32_inactive_mixed_policy_is_bitwise_identical(backend):
+    """The new setting must not alter the cleared non-autocast computation."""
+    if backend == "tiled" and DEVICE != "cuda":
+        pytest.skip("The tiled regression requires explicit CUDA execution")
+    legacy = OLMo(tiny(recurrent_layers=[3], recurrent_backend=backend,
+                       include_bias=False, bias_for_layer_norm=False))
+    candidate = OLMo(tiny(recurrent_layers=[3], recurrent_backend=backend,
+                          recurrent_precision_policy="bf16_fp32_state",
+                          include_bias=False, bias_for_layer_norm=False))
+    candidate.load_state_dict(legacy.state_dict(), strict=True)
+    tokens = torch.randint(1, 32, (2, 7), device=DEVICE)
+    retained_inputs = []
+    def keep_input(module, inputs):
+        inputs[0].retain_grad()
+        retained_inputs.append(inputs[0])
+    hooks = [model.transformer.blocks[3].register_forward_pre_hook(keep_input)
+             for model in (legacy, candidate)]
+    outputs = [model(tokens).logits for model in (legacy, candidate)]
+    assert torch.equal(*outputs)
+    cotangent = torch.randn_like(outputs[0])
+    for output in outputs:
+        output.backward(cotangent)
+    assert torch.equal(retained_inputs[0].grad, retained_inputs[1].grad)
+    for (name_a, a), (name_b, b) in zip(legacy.named_parameters(), candidate.named_parameters()):
+        assert name_a == name_b and a.grad is not None and b.grad is not None
+        assert torch.equal(a.grad, b.grad), name_a
+    for hook in hooks:
+        hook.remove()
+
+
+def test_fp32_attention_helpers_preserve_precision_under_outer_cpu_autocast():
+    """Exercise the new arithmetic branch on CPU without claiming CUDA clearance."""
+    from olmo.model import block_attention_add, recompute_alphas, recompute_atts
+    def eager(helper):
+        return getattr(helper, "_torchdynamo_orig_callable", helper)
+    # Key-major/query-major layout matches the recurrent backward helpers.
+    q, k, v, k_init, v_init = [torch.randn(4, 1, 2, 8).bfloat16() for _ in range(5)]
+    bias = torch.randn(1, 2, 4, 4) * 0.1
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        alphas = eager(recompute_alphas)(k, k_init, q, bias, True)
+        atts = eager(recompute_atts)(v, v_init, alphas, True)
+    assert alphas.dtype == atts.dtype == torch.float32
+    scores = k.float().permute(1, 2, 0, 3) @ q.float().permute(1, 2, 3, 0)
+    scores.diagonal(dim1=2, dim2=3).copy_((q.float() * k_init.float()).sum(-1).permute(1, 2, 0))
+    scores += bias.permute(0, 1, 3, 2)
+    scores.masked_fill_(torch.ones(4, 4, dtype=torch.bool).tril(-1), -float("inf"))
+    expected_alphas = scores.softmax(dim=-2)
+    torch.testing.assert_close(alphas, expected_alphas, rtol=0, atol=0)
+    expected_atts = v.float().permute(1, 2, 3, 0) @ expected_alphas
+    expected_atts = expected_atts.permute(3, 0, 1, 2)
+    expected_atts += (v_init.float() - v.float()) * expected_alphas.diagonal(dim1=2, dim2=3).permute(2, 0, 1).unsqueeze(-1)
+    torch.testing.assert_close(atts, expected_atts, rtol=0, atol=0)
+
+    query, keys, values = q.permute(1, 2, 0, 3), k[:2].permute(1, 2, 0, 3), v[:2].permute(1, 2, 0, 3)
+    maximum = (q.float() * k_init.float()).sum(-1)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        weighted, maximum_after, denominator = eager(block_attention_add)(
+            v_init.float(), maximum, torch.ones_like(maximum), keys, values, query, None, True)
+    assert weighted.dtype == maximum_after.dtype == denominator.dtype == torch.float32
+    # Compare each query's online merged state against its independent dense sum.
+    logits = query.float() @ keys.float().transpose(-2, -1)
+    logits = torch.cat([maximum.permute(1, 2, 0).unsqueeze(-1), logits], dim=-1)
+    probs = logits.softmax(-1)
+    expected = probs[..., :1] * v_init.float().permute(1, 2, 0, 3) + probs[..., 1:] @ values.float()
+    actual = (weighted / denominator.unsqueeze(-1)).permute(1, 2, 0, 3)
+    assert_close(expected, actual, "FP32 online attention")
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(DEVICE != "cuda", reason="explicit GPU execution required")
+@pytest.mark.parametrize("backend,eager", [("naive", True), ("tiled", True), ("tiled", False)])
+def test_bf16_fp32_state_dtype_contract_and_update(backend, eager):
+    """A dtype/finite-update regression, not the task-specific numerical gate."""
+    model = OLMo(tiny(recurrent_layers=[3], recurrent_backend=backend, reference_eager=eager,
+                      recurrent_precision_policy="bf16_fp32_state", bwd_mlp_chunks=4,
+                      include_bias=False, bias_for_layer_norm=False))
+    observed = defaultdict(list)
+    def observer(phase, tensors, token_index=None):
+        observed[phase].append({name: tensor.dtype for name, tensor in tensors.items()})
+    model.transformer.blocks[3]._recurrent_precision_observer = observer
+    tokens = torch.randint(1, 32, (2, 9), device=DEVICE)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5, betas=(0.9, 0.95),
+                                  eps=1e-8, weight_decay=0, foreach=False, fused=False)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        logits = model(tokens).logits
+        loss = F.cross_entropy(logits[:, -1].float(), torch.tensor([3, 7], device=DEVICE))
+    assert logits.dtype == torch.bfloat16 and loss.dtype == torch.float32
+    loss.backward()
+    for parameter in model.parameters():
+        assert parameter.dtype == torch.float32 and parameter.grad is not None
+        assert parameter.grad.dtype == torch.float32 and torch.isfinite(parameter.grad).all()
+    optimizer.step()
+    for state in optimizer.state.values():
+        assert state["exp_avg"].dtype == state["exp_avg_sq"].dtype == torch.float32
+    assert observed["forward.projected"]
+    assert all(row["q"] == row["k"] == row["v"] == torch.bfloat16 for row in observed["forward.projected"])
+    assert all(row["k"] == row["v"] == torch.bfloat16 for row in observed["forward.permanent_storage"])
+    assert all(row["attention"] == torch.bfloat16 for row in observed["forward.mlp_input"])
+    assert all(row["output"] == torch.float32 for row in observed["forward.output"])
+    assert all(row["attention"] == torch.float32 for row in observed["forward.attention"])
+    if backend == "tiled":
+        for phase in ("forward.initial_state", "forward.running_state", "backward.recomputed_attention",
+                      "backward.buffers", "backward.attention_adjoint", "backward.pre_attention_adjoint"):
+            assert observed[phase], phase
+            assert all(dtype == torch.float32 for row in observed[phase] for dtype in row.values()), phase
+        assert all(row["attention"] == torch.bfloat16 for row in observed["backward.mlp_input"])

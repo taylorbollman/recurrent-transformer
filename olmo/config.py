@@ -314,6 +314,13 @@ class ModelConfig(BaseConfig):
     recurrent_write_rho: float = 1.0
     """Persistent-write interpolation. Fractional values require pre-norm naïve recurrence."""
 
+    recurrent_precision_policy: str = "legacy"
+    """Opt-in CUDA BF16 policy: BF16 projections with FP32 recurrent attention state.
+
+    ``bf16_fp32_state`` is active only inside CUDA BF16 autocast. Parameters and
+    the residual stream remain FP32. ``legacy`` preserves the original path.
+    """
+
     reference_eager: bool = False
     """Bypass compiled recurrence helpers and internal autocast for a numerical oracle.
 
@@ -329,6 +336,8 @@ class ModelConfig(BaseConfig):
 
     def validate_recurrence(self) -> None:
         """Validate the bounded mixed-stack contract before constructing any weights."""
+        if self.recurrent_precision_policy not in ("legacy", "bf16_fp32_state"):
+            raise OLMoConfigurationError("recurrent_precision_policy must be legacy or bf16_fp32_state")
         if self.recurrent_backend not in ("naive", "tiled"):
             raise OLMoConfigurationError("recurrent_backend must be naive or tiled")
         if not 0.0 <= self.recurrent_write_rho <= 1.0:
