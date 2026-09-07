@@ -14,6 +14,7 @@ from collections import defaultdict
 from contextlib import nullcontext
 from functools import partial
 from typing import (
+    Any,
     Callable,
     Dict,
     Iterable,
@@ -34,6 +35,7 @@ from torch import einsum
 
 from .aliases import PathOrStr
 from .beam_search import BeamSearch, Constraint, FinalSequenceScorer, Sampler
+from .cdrm import CDRMSideMemory, require_fp32
 from .config import (
     ActivationCheckpointingStrategy,
     ActivationType,
@@ -640,6 +642,14 @@ class OLMoBlock(nn.Module):
                 k = k.repeat_interleave(num_q_heads // num_kv_heads, dim=1, output_size=num_q_heads)
                 v = v.repeat_interleave(num_q_heads // num_kv_heads, dim=1, output_size=num_q_heads)
 
+            if self.config.cdrm_enabled:
+                # The reference CDRM preview/suffix use the established math
+                # attention policy, independently of the caller's global flags.
+                from torch.nn.attention import SDPBackend, sdpa_kernel
+                with sdpa_kernel(SDPBackend.MATH):
+                    return F.scaled_dot_product_attention(
+                        q, k, v, attn_mask=attn_mask, dropout_p=dropout_p, is_causal=is_causal,
+                    )
             return F.scaled_dot_product_attention(
                 q,
                 k,
@@ -1802,6 +1812,9 @@ class OLMoOutput(NamedTuple):
     Hidden state after final layer norm and before the logit projection.
     """
 
+    cdrm_states: Optional[Dict[str, Any]] = None
+    """Requested graph-connected side states; ordinary hidden-state indices are unchanged."""
+
 
 class OLMoGenerateOutput(NamedTuple):
     token_ids: torch.LongTensor
@@ -1885,6 +1898,7 @@ class OLMo(nn.Module):
 
         # Validate config.
         self.config.validate_recurrence()
+        self.config.validate_cdrm()
         if self.config.alibi and self.config.flash_attention:
             raise OLMoConfigurationError("ALiBi is currently not supported with FlashAttention")
 
@@ -1972,6 +1986,12 @@ class OLMo(nn.Module):
             get_causal_attention_bias(self.__cache, config.max_sequence_length, _non_meta_init_device(config))
             self.get_alibi_attention_bias(config.max_sequence_length, _non_meta_init_device(config))
 
+        # Construct adapters after backbone initialization so a shared seed gives
+        # exactly the same ordinary backbone as SEQ. The owner is never registered
+        # inside this side module: forward passes it functionally instead.
+        if self.config.cdrm_enabled:
+            self.cdrm = CDRMSideMemory(config)
+
     def set_recurrent_write_rho(self, rho: float) -> None:
         """Update the model and independently owned block configs together."""
         self.config.update_with(recurrent_write_rho=rho).validate_recurrence()
@@ -1983,6 +2003,8 @@ class OLMo(nn.Module):
     def set_activation_checkpointing(
         self, strategy: Optional[ActivationCheckpointingStrategy], checkpoint_func: Optional[Callable] = None
     ):
+        if self.config.cdrm_enabled and strategy is not None:
+            raise OLMoConfigurationError("CDRM activation checkpointing is outside the FP32 reference contract")
         if strategy is not None and any(isinstance(b, OLMoRecurrentBlockTiled) for b in self.modules()):
             raise OLMoConfigurationError("activation checkpointing with tiled recurrence is not yet validated")
         self.activation_checkpointing_strategy = strategy
@@ -2067,6 +2089,8 @@ class OLMo(nn.Module):
         else:
             for block_group in self.transformer.block_groups:
                 block_group.reset_parameters()
+        if hasattr(self, "cdrm"):
+            self.cdrm.reset_parameters()
 
     def get_alibi_attention_bias(self, seq_len: int, device: torch.device) -> torch.Tensor:
         if (alibi_bias := self.__cache.get("alibi_attention_bias")) is not None and alibi_bias.shape[
@@ -2095,6 +2119,7 @@ class OLMo(nn.Module):
         return_logits: bool = True,
         doc_lens: Optional[torch.Tensor] = None,
         max_doc_lens: Optional[Sequence[int]] = None,
+        output_cdrm_states: Optional[bool] = None,
     ) -> OLMoOutput:
         """
         :param input_ids: A tensor of shape `(batch_size, seq_len)`.
@@ -2130,6 +2155,19 @@ class OLMo(nn.Module):
         :param max_doc_lens: Maximum document length for each instance in the batch.
         """
         output_hidden_states = output_hidden_states if output_hidden_states is not None else False
+        cdrm_states = None
+        want_cdrm_states = self.config.cdrm_output_states if output_cdrm_states is None else output_cdrm_states
+        if self.config.cdrm_enabled:
+            self.config.validate_cdrm()
+            if (past_key_values is not None or use_cache or doc_lens is not None or max_doc_lens is not None
+                    or attention_mask is not None or attention_bias is not None):
+                raise OLMoConfigurationError("CDRM supports unpadded independent inputs with built-in causal ALiBi only; no cache, packing, or custom masks/bias")
+            if self.activation_checkpointing_strategy is not None:
+                raise OLMoConfigurationError("CDRM activation checkpointing is not validated")
+            reference_input = self.transformer.wte.weight if input_embeddings is None else input_embeddings
+            require_fp32(self, reference_input)
+        elif want_cdrm_states:
+            raise OLMoConfigurationError("output_cdrm_states requires cdrm_enabled")
 
         has_recurrence = any(self.config.block_type_for_layer(i) in (
             BlockType.recurrent, BlockType.recurrent_autograd
@@ -2251,6 +2289,15 @@ class OLMo(nn.Module):
                         cu_doc_lens=cu_doc_lens,
                     )
 
+                if self.config.cdrm_enabled:
+                    if block_idx == self.config.cdrm_early_layer:
+                        p3 = x
+                    if block_idx == self.config.cdrm_late_layer:
+                        x, cdrm_states = self.cdrm(
+                            p3, x, self.transformer.blocks[self.config.cdrm_early_layer],
+                            attention_bias, output_states=want_cdrm_states,
+                        )
+
                 if attn_key_values is not None:
                     assert cache is not None
                     attn_key_values.append(cache)
@@ -2307,6 +2354,7 @@ class OLMo(nn.Module):
             attn_key_values=attn_key_values,
             hidden_states=tuple(all_hidden_states) if output_hidden_states else None,
             pre_logits=pre_logits if return_pre_logits else None,
+            cdrm_states=cdrm_states,
         )
 
     def get_fsdp_wrap_policy(self, wrap_strategy: Optional[FSDPWrapStrategy] = None):

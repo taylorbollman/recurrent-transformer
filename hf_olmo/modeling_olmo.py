@@ -133,7 +133,9 @@ class OLMoForCausalLM(PreTrainedModel, GenerationMixin):
             loss = loss_fct(shift_logits, shift_labels)
 
         if not return_dict:
-            output = (logits,) + outputs[1:]
+            # Keep the wrapper's established tuple contract when the native
+            # output gains optional diagnostics such as CDRM side states.
+            output = (logits, outputs.attn_key_values, hidden_states, outputs.pre_logits)
             return (loss,) + output if loss is not None else output
 
         return CausalLMOutputWithPast(

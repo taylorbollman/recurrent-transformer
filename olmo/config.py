@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from glob import glob
@@ -326,6 +327,56 @@ class ModelConfig(BaseConfig):
 
     An explicit outer autocast context may still be used for BF16 comparisons.
     """
+
+    cdrm_enabled: bool = False
+    """Ordinary preview, then an autograd side scan and a late residual bridge."""
+    cdrm_early_layer: int = 3
+    cdrm_late_layer: int = 8
+    cdrm_backend: str = "naive"
+    cdrm_epsilon: float = 0.1
+    cdrm_rho: float = 1.0
+    cdrm_lambda: float = 0.01
+    cdrm_source: str = "deep"
+    """Candidate adapter input: deep (p8-p3) or active same_depth (p3)."""
+    cdrm_read_mode: str = "history"
+    """history reads earlier permanent records; current_only is a diagnostic."""
+    cdrm_norm_eps: float = 1e-6
+    cdrm_adapter_init_scale: float = 1.0
+    """Each bias-free adapter is initialized N(0, scale / sqrt(d_model))."""
+    cdrm_output_states: bool = False
+    """Expose named graph-connected side states without changing hidden-state indices."""
+
+    def validate_cdrm(self) -> None:
+        """Fail closed outside the initial ordinary-autograd FP32 contract."""
+        if not self.cdrm_enabled:
+            return
+        if (self.block_type != BlockType.sequential or self.recurrent_layers not in (None, [])
+                or self.recurrent_backend != "naive" or self.recurrent_write_rho != 1.0
+                or self.recurrent_precision_policy != "legacy"):
+            raise OLMoConfigurationError("CDRM requires ordinary sequential blocks and no R3 replacement/policy")
+        if self.cdrm_backend != "naive":
+            raise OLMoConfigurationError("CDRM supports only the naive ordinary-autograd backend")
+        if (type(self.cdrm_early_layer) is not int or type(self.cdrm_late_layer) is not int
+                or not 0 <= self.cdrm_early_layer < self.cdrm_late_layer < self.n_layers - 1):
+            raise OLMoConfigurationError("CDRM indices must satisfy 0 <= early < late < n_layers-1")
+        if (self.norm_after or not self.alibi or self.rope or self.flash_attention
+                or self.effective_n_kv_heads != self.n_heads or self.block_group_size != 1):
+            raise OLMoConfigurationError("CDRM requires pre-norm ALiBi, full MHA, no FlashAttention, block_group_size=1")
+        if self.attention_dropout or self.residual_dropout or self.embedding_dropout:
+            raise OLMoConfigurationError("CDRM requires all dropout=0")
+        if self.precision not in (None, "fp32", torch.float32):
+            raise OLMoConfigurationError("CDRM requires FP32 precision with autocast disabled")
+        if self.cdrm_source not in ("deep", "same_depth"):
+            raise OLMoConfigurationError("cdrm_source must be deep or same_depth")
+        if self.cdrm_read_mode not in ("history", "current_only"):
+            raise OLMoConfigurationError("cdrm_read_mode must be history or current_only")
+        if not all(math.isfinite(g) for g in (self.cdrm_epsilon, self.cdrm_rho, self.cdrm_lambda)):
+            raise OLMoConfigurationError("CDRM gates must be finite")
+        if not 0.0 <= self.cdrm_rho <= 1.0:
+            raise OLMoConfigurationError("cdrm_rho must be in [0, 1]")
+        if not (math.isfinite(self.cdrm_norm_eps) and self.cdrm_norm_eps > 0
+                and math.isfinite(self.cdrm_adapter_init_scale) and self.cdrm_adapter_init_scale > 0):
+            raise OLMoConfigurationError("CDRM normalization epsilon and adapter initialization scale must be positive")
 
     def block_type_for_layer(self, index: int) -> BlockType:
         if self.recurrent_layers is None:
