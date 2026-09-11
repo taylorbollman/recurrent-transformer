@@ -35,7 +35,7 @@ from torch import einsum
 
 from .aliases import PathOrStr
 from .beam_search import BeamSearch, Constraint, FinalSequenceScorer, Sampler
-from .cdrm import CDRMSideMemory, require_fp32
+from .cdrm import CDRMSideMemory, require_cdrm_precision
 from .config import (
     ActivationCheckpointingStrategy,
     ActivationType,
@@ -642,7 +642,7 @@ class OLMoBlock(nn.Module):
                 k = k.repeat_interleave(num_q_heads // num_kv_heads, dim=1, output_size=num_q_heads)
                 v = v.repeat_interleave(num_q_heads // num_kv_heads, dim=1, output_size=num_q_heads)
 
-            if self.config.cdrm_enabled:
+            if self.config.cdrm_enabled or self.config.ordinary_attention_precision_policy == "fp32":
                 # The reference CDRM preview/suffix use the established math
                 # attention policy, independently of the caller's global flags.
                 from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -826,6 +826,10 @@ class OLMoSequentialBlock(OLMoBlock):
         max_doc_len: Optional[int] = None,
         cu_doc_lens: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        if self.config.ordinary_attention_precision_policy == "fp32":
+            return self._fp32_attention_forward(
+                x, attention_bias, layer_past, use_cache, max_doc_len, cu_doc_lens,
+            )
         # Get query, key, value projections.
         # shape:
         #  - for regular attn q, k, v: (batch_size, seq_len, d_model)
@@ -914,6 +918,39 @@ class OLMoSequentialBlock(OLMoBlock):
         x = og_x + x
 
         return x, cache
+
+    def _fp32_attention_forward(
+        self,
+        x: torch.Tensor,
+        attention_bias: Optional[torch.Tensor] = None,
+        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        use_cache: bool = False,
+        max_doc_len: Optional[int] = None,
+        cu_doc_lens: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        """Ordinary-call precision placement; shared fabric helpers stay independent."""
+        self.config.validate_ordinary_attention_precision()
+        if (self._activation_checkpoint_fn is not None or layer_past is not None or use_cache
+                or max_doc_len is not None or cu_doc_lens is not None):
+            raise OLMoConfigurationError("FP32 ordinary attention does not support checkpointing, cached or packed inputs")
+        if x.dtype != torch.float32 or any(parameter.dtype != torch.float32 for parameter in self.parameters()):
+            raise OLMoConfigurationError("FP32 ordinary attention requires FP32 residuals and parameters")
+        if torch.is_autocast_enabled(x.device.type) and torch.get_autocast_dtype(x.device.type) != torch.bfloat16:
+            raise OLMoConfigurationError("FP32 ordinary attention supports FP32 execution or outer BF16 autocast")
+        # This operation order matches the validated ordinary_attention_fp32
+        # diagnostic wrapper. Do not move the context onto shared child modules:
+        # CDRM reuses their parameters with its independent dense precision policy.
+        with torch.autocast(x.device.type, enabled=False):
+            h = self.attn_norm(x.float())
+            qkv = self.att_proj(h)
+            q, k, v = qkv.split(self.fused_dims, dim=-1)
+            attention, cache = self.attention(q, k, v, attention_bias)
+            x = x + self.dropout(attention)
+        h = self.ff_norm(x)
+        h = self.ff_proj(h)
+        h = self.act(h)
+        h = self.ff_out(h)
+        return x + self.dropout(h), cache
     
     def forward(
         self,
@@ -1898,6 +1935,7 @@ class OLMo(nn.Module):
 
         # Validate config.
         self.config.validate_recurrence()
+        self.config.validate_ordinary_attention_precision()
         self.config.validate_cdrm()
         if self.config.alibi and self.config.flash_attention:
             raise OLMoConfigurationError("ALiBi is currently not supported with FlashAttention")
@@ -2003,6 +2041,8 @@ class OLMo(nn.Module):
     def set_activation_checkpointing(
         self, strategy: Optional[ActivationCheckpointingStrategy], checkpoint_func: Optional[Callable] = None
     ):
+        if self.config.ordinary_attention_precision_policy == "fp32" and strategy is not None:
+            raise OLMoConfigurationError("FP32 ordinary attention activation checkpointing is not validated")
         if self.config.cdrm_enabled and strategy is not None:
             raise OLMoConfigurationError("CDRM activation checkpointing is outside the FP32 reference contract")
         if strategy is not None and any(isinstance(b, OLMoRecurrentBlockTiled) for b in self.modules()):
@@ -2155,6 +2195,13 @@ class OLMo(nn.Module):
         :param max_doc_lens: Maximum document length for each instance in the batch.
         """
         output_hidden_states = output_hidden_states if output_hidden_states is not None else False
+        if self.config.ordinary_attention_precision_policy == "fp32":
+            self.config.validate_ordinary_attention_precision()
+            if (past_key_values is not None or use_cache or doc_lens is not None or max_doc_lens is not None
+                    or attention_mask is not None or attention_bias is not None):
+                raise OLMoConfigurationError("FP32 ordinary attention supports independent inputs with built-in causal ALiBi only; no cache, packing, or custom masks/bias")
+            if self.activation_checkpointing_strategy is not None:
+                raise OLMoConfigurationError("FP32 ordinary attention activation checkpointing is not validated")
         cdrm_states = None
         want_cdrm_states = self.config.cdrm_output_states if output_cdrm_states is None else output_cdrm_states
         if self.config.cdrm_enabled:
@@ -2165,7 +2212,7 @@ class OLMo(nn.Module):
             if self.activation_checkpointing_strategy is not None:
                 raise OLMoConfigurationError("CDRM activation checkpointing is not validated")
             reference_input = self.transformer.wte.weight if input_embeddings is None else input_embeddings
-            require_fp32(self, reference_input)
+            require_cdrm_precision(self, reference_input)
         elif want_cdrm_states:
             raise OLMoConfigurationError("output_cdrm_states requires cdrm_enabled")
 

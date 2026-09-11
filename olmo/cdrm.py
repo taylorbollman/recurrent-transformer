@@ -1,4 +1,4 @@
-"""Ordinary-autograd FP32 cross-depth read-conditioned memory.
+"""Cross-depth read-conditioned memory with a strict FP32 autograd oracle.
 
 The ordinary early block owns every reader/writer parameter. This module owns
 only two adapters, and receives that block functionally on each call. In
@@ -28,6 +28,28 @@ def require_fp32(module: nn.Module, x: torch.Tensor) -> None:
         raise OLMoConfigurationError("CDRM FP32 reference requires TF32 disabled")
 
 
+def require_cdrm_precision(module: nn.Module, x: torch.Tensor) -> None:
+    """Select an explicit execution policy without weakening the FP32 oracle."""
+    if module.config.cdrm_precision_policy == "fp32":
+        require_fp32(module, x)
+    else:
+        if (x.device.type != "cuda" or not torch.is_autocast_enabled("cuda")
+                or torch.get_autocast_dtype("cuda") != torch.bfloat16):
+            raise OLMoConfigurationError("CDRM bf16_fp32_state requires explicit CUDA BF16 autocast")
+        if x.dtype != torch.float32 or any(p.dtype != torch.float32 for p in module.parameters()):
+            raise OLMoConfigurationError("CDRM bf16_fp32_state requires FP32 residuals and parameters")
+        if torch.backends.cuda.matmul.allow_tf32:
+            raise OLMoConfigurationError("CDRM mixed validation requires TF32 disabled")
+    if module.config.cdrm_backend == "tiled" and x.device.type != "cuda":
+        raise OLMoConfigurationError("Tiled CDRM requires CUDA; use naive for the CPU oracle")
+
+
+def norm_fp32(norm: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Use FP32 norm arithmetic before an explicitly chosen projection cast."""
+    with torch.autocast(x.device.type, enabled=False):
+        return norm(x.float())
+
+
 class StatelessRMSNorm(nn.Module):
     """The adapter normalizer; it does not replace the owner's learned norms."""
 
@@ -51,28 +73,30 @@ def _clip(owner: nn.Module, x: torch.Tensor) -> torch.Tensor:
 
 def pre3(owner: nn.Module, p3: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Pre-norm, canonical differentiable Q/K/V slices, QK norm, then heads."""
-    h = owner.attn_norm(p3)
+    mixed = owner.config.cdrm_precision_policy == "bf16_fp32_state"
+    h = norm_fp32(owner.attn_norm, p3) if mixed else owner.attn_norm(p3)
     qdim, kdim, vdim = owner.fused_dims
     weight, bias = owner.att_proj.weight, owner.att_proj.bias
     q = _clip(owner, F.linear(h, weight[:qdim], None if bias is None else bias[:qdim]))
     kv = _clip(owner, F.linear(h, weight[qdim:], None if bias is None else bias[qdim:]))
     k, v = kv.split((kdim, vdim), dim=-1)
     if owner.q_norm is not None:
-        q = owner.q_norm(q)
+        q = norm_fp32(owner.q_norm, q).to(q.dtype) if mixed else owner.q_norm(q)
     if owner.k_norm is not None:
-        k = owner.k_norm(k)
+        k = norm_fp32(owner.k_norm, k).to(k.dtype) if mixed else owner.k_norm(k)
     return _heads(owner, q), _heads(owner, k), _heads(owner, v)
 
 
 def persistent_kv3(owner: nn.Module, m: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Project the residual-space record after its read-conditioned update."""
-    h = owner.attn_norm(m)
+    mixed = owner.config.cdrm_precision_policy == "bf16_fp32_state"
+    h = norm_fp32(owner.attn_norm, m) if mixed else owner.attn_norm(m)
     qdim, kdim, vdim = owner.fused_dims
     bias = owner.att_proj.bias
     kv = _clip(owner, F.linear(h, owner.att_proj.weight[qdim:], None if bias is None else bias[qdim:]))
     k, v = kv.split((kdim, vdim), dim=-1)
     if owner.k_norm is not None:
-        k = owner.k_norm(k)
+        k = norm_fp32(owner.k_norm, k).to(k.dtype) if mixed else owner.k_norm(k)
     return _heads(owner, k), _heads(owner, v)
 
 
@@ -92,6 +116,9 @@ def read3(owner: nn.Module, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
 
 def post3(owner: nn.Module, candidate: torch.Tensor, read: torch.Tensor) -> torch.Tensor:
     """Exactly the owner's pre-norm residual/MLP path after projected attention."""
+    if owner.config.cdrm_precision_policy == "bf16_fp32_state":
+        x = candidate + owner.dropout(read).float()
+        return x + owner.dropout(owner.ff_out(owner.act(owner.ff_proj(norm_fp32(owner.ff_norm, x))))).float()
     x = candidate + owner.dropout(read)
     return x + owner.dropout(owner.ff_out(owner.act(owner.ff_proj(owner.ff_norm(x)))))
 
@@ -118,8 +145,8 @@ class CDRMSideMemory(nn.Module):
                 attention_bias: torch.Tensor, output_states: bool = False
                 ) -> Tuple[torch.Tensor, Optional[Dict[str, Any]]]:
         self.config.validate_cdrm()
-        require_fp32(self, p3)
-        require_fp32(owner, p8)
+        require_cdrm_precision(self, p3)
+        require_cdrm_precision(owner, p8)
         if p3.ndim != 3 or p3.shape != p8.shape or p3.shape[-1] != self.config.d_model or p3.shape[1] == 0:
             raise OLMoConfigurationError("CDRM requires matching nonempty [B,T,D] p3/p8 tensors")
         if p3.device != p8.device:
@@ -136,9 +163,24 @@ class CDRMSideMemory(nn.Module):
             raise OLMoConfigurationError("CDRM requires an FP32 [1|B,1|H,T,T] absolute-position attention bias")
 
         source = p8 - p3 if self.config.cdrm_source == "deep" else p3
-        deep_correction = self.config.cdrm_epsilon * self.deep_adapter(self.deep_norm(source))
+        deep_correction = self.config.cdrm_epsilon * self.deep_adapter(self.deep_norm(source)).float()
         candidate = p3 + deep_correction
         query, temporary_k, temporary_v = pre3(owner, p3)
+        if self.config.cdrm_backend == "tiled":
+            from .cdrm_tiled import tiled_scan
+            hat_m = tiled_scan(candidate, query, temporary_k, temporary_v, owner, attention_bias)
+            bridge_correction = self.config.cdrm_lambda * self.bridge_adapter(self.bridge_norm(hat_m - p3)).float()
+            v8 = p8 + bridge_correction
+            states = None
+            if output_states:
+                # These are true outer-autograd nodes. Internal custom-scan
+                # records are not presented as graph-connected diagnostic views.
+                states = dict(p3=p3, p8=p8, candidate=candidate, hat_m=hat_m,
+                              m=hat_m, v8=v8, deep_correction=deep_correction,
+                              bridge_correction=bridge_correction, query=query,
+                              temporary_k=temporary_k, temporary_v=temporary_v,
+                              diagnostic_scope="tiled_outer_graph")
+            return v8, states
         history_k, history_v, proposed, records, read_outputs = [], [], [], [], []
 
         for token in range(t):

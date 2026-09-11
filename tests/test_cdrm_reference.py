@@ -455,7 +455,7 @@ def test_adam_state_and_next_update_survive_serialization():
 
 
 @pytest.mark.parametrize("bad", [
-    {"recurrent_layers": [3]}, {"cdrm_backend": "tiled"}, {"cdrm_rho": -0.1},
+    {"recurrent_layers": [3]}, {"cdrm_backend": "unknown"}, {"cdrm_rho": -0.1},
     {"cdrm_rho": 1.1}, {"cdrm_lambda": float("nan")}, {"cdrm_epsilon": float("inf")},
     {"cdrm_early_layer": 8}, {"cdrm_late_layer": 11}, {"cdrm_source": "unknown"},
     {"cdrm_read_mode": "unknown"}, {"cdrm_norm_eps": 0.0}, {"cdrm_adapter_init_scale": 0.0},

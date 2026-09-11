@@ -306,6 +306,16 @@ class ModelConfig(BaseConfig):
     The transformer block implementation.
     """
 
+    ordinary_attention_precision_policy: str = "legacy"
+    """Precision of every ordinary sequential block's attention region.
+
+    ``legacy`` preserves the existing execution. ``fp32`` keeps the pre-attention
+    norm, QKV projection, Q/K norms, math attention and output projection in FP32,
+    while MLPs, the final head and a shared CDRM fabric retain their own policies.
+    The explicit policy requires FP32 parameters/residuals and supports FP32
+    execution or outer BF16 autocast within the bounded ALiBi training profile.
+    """
+
     recurrent_layers: Optional[List[int]] = None
     """Explicit recurrent replacement indices; None preserves legacy global block_type."""
 
@@ -329,10 +339,16 @@ class ModelConfig(BaseConfig):
     """
 
     cdrm_enabled: bool = False
-    """Ordinary preview, then an autograd side scan and a late residual bridge."""
+    """Ordinary preview, then a side memory scan and a late residual bridge."""
     cdrm_early_layer: int = 3
     cdrm_late_layer: int = 8
     cdrm_backend: str = "naive"
+    cdrm_precision_policy: str = "fp32"
+    """Strict FP32 reference, or tiled CUDA BF16 dense ops with FP32 state.
+
+    bf16_fp32_state requires explicit outer CUDA BF16 autocast; parameters and
+    residuals remain FP32. The naive backend remains a strict FP32 oracle.
+    """
     cdrm_epsilon: float = 0.1
     cdrm_rho: float = 1.0
     cdrm_lambda: float = 0.01
@@ -346,16 +362,39 @@ class ModelConfig(BaseConfig):
     cdrm_output_states: bool = False
     """Expose named graph-connected side states without changing hidden-state indices."""
 
+    def validate_ordinary_attention_precision(self) -> None:
+        if self.ordinary_attention_precision_policy not in ("legacy", "fp32"):
+            raise OLMoConfigurationError("ordinary_attention_precision_policy must be legacy or fp32")
+        if self.ordinary_attention_precision_policy == "legacy":
+            return
+        if (self.block_type != BlockType.sequential or self.recurrent_layers not in (None, [])
+                or self.recurrent_precision_policy != "legacy"):
+            raise OLMoConfigurationError("FP32 ordinary attention requires ordinary sequential blocks without R3")
+        if (self.norm_after or not self.alibi or self.rope or self.flash_attention
+                or self.effective_n_kv_heads != self.n_heads or self.block_group_size != 1):
+            raise OLMoConfigurationError("FP32 ordinary attention requires pre-norm ALiBi, full MHA, no FlashAttention, block_group_size=1")
+        if self.attention_dropout or self.residual_dropout or self.embedding_dropout or self.clip_qkv is not None:
+            raise OLMoConfigurationError("FP32 ordinary attention requires dropout=0 and no QKV clipping")
+        if self.precision not in (None, "fp32", torch.float32):
+            raise OLMoConfigurationError("FP32 ordinary attention requires FP32 parameters and explicit outer BF16 autocast for mixed execution")
+
     def validate_cdrm(self) -> None:
-        """Fail closed outside the initial ordinary-autograd FP32 contract."""
+        """Validate the reference and explicitly supported tiled CDRM profiles."""
         if not self.cdrm_enabled:
             return
         if (self.block_type != BlockType.sequential or self.recurrent_layers not in (None, [])
                 or self.recurrent_backend != "naive" or self.recurrent_write_rho != 1.0
                 or self.recurrent_precision_policy != "legacy"):
             raise OLMoConfigurationError("CDRM requires ordinary sequential blocks and no R3 replacement/policy")
-        if self.cdrm_backend != "naive":
-            raise OLMoConfigurationError("CDRM supports only the naive ordinary-autograd backend")
+        if self.cdrm_backend not in ("naive", "tiled"):
+            raise OLMoConfigurationError("CDRM backend must be naive or tiled")
+        if self.cdrm_precision_policy not in ("fp32", "bf16_fp32_state"):
+            raise OLMoConfigurationError("Unknown CDRM precision policy")
+        if self.cdrm_backend == "naive" and self.cdrm_precision_policy != "fp32":
+            raise OLMoConfigurationError("Naive CDRM remains a strict FP32 reference")
+        if self.cdrm_backend == "tiled" and (
+                self.cdrm_rho != 1.0 or self.cdrm_source != "deep" or self.cdrm_read_mode != "history"):
+            raise OLMoConfigurationError("Tiled CDRM requires rho=1, deep source and history reads")
         if (type(self.cdrm_early_layer) is not int or type(self.cdrm_late_layer) is not int
                 or not 0 <= self.cdrm_early_layer < self.cdrm_late_layer < self.n_layers - 1):
             raise OLMoConfigurationError("CDRM indices must satisfy 0 <= early < late < n_layers-1")
@@ -365,7 +404,7 @@ class ModelConfig(BaseConfig):
         if self.attention_dropout or self.residual_dropout or self.embedding_dropout:
             raise OLMoConfigurationError("CDRM requires all dropout=0")
         if self.precision not in (None, "fp32", torch.float32):
-            raise OLMoConfigurationError("CDRM requires FP32 precision with autocast disabled")
+            raise OLMoConfigurationError("CDRM keeps FP32 parameters; select mixed execution with cdrm_precision_policy and outer autocast")
         if self.cdrm_source not in ("deep", "same_depth"):
             raise OLMoConfigurationError("cdrm_source must be deep or same_depth")
         if self.cdrm_read_mode not in ("history", "current_only"):
